@@ -1,0 +1,5 @@
+slack-sdk
+fastapi
+uvicorn
+python-dotenv
+pyyaml

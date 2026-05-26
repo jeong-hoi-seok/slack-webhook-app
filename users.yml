@@ -1,0 +1,4 @@
+# GitLab username: Slack User ID
+# 슬랙 User ID는 프로필 → 점세개 → Copy member ID
+gitlab_to_slack:
+  jeoing3135: U0ARZUCNUBZ
