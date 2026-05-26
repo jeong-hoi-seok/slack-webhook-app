@@ -1,18 +1,34 @@
 import os
+import re
+import logging
+import pathlib
 import yaml
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 import store
 
 load_dotenv()
 
-app = FastAPI()
-client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
-CHANNEL = os.getenv("SLACK_CHANNEL_ID")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-with open("users.yml", "r") as f:
+_BASE = pathlib.Path(__file__).parent
+
+_token = os.getenv("SLACK_BOT_TOKEN")
+CHANNEL = os.getenv("SLACK_CHANNEL_ID")
+GITLAB_WEBHOOK_TOKEN = os.getenv("GITLAB_WEBHOOK_TOKEN")
+
+if not _token or not CHANNEL:
+    raise RuntimeError("SLACK_BOT_TOKEN and SLACK_CHANNEL_ID must be set")
+
+client = WebClient(token=_token)
+app = FastAPI()
+
+with open(_BASE / "users.yml", "r") as f:
     USER_MAP: dict = yaml.safe_load(f)["gitlab_to_slack"]
+
+_TEMPLATE_SECTION_RE = re.compile(r"^##\s*2[\.\s]", re.MULTILINE)
 
 
 def mention(username: str) -> str:
@@ -30,10 +46,7 @@ def truncate(text: str, limit: int = 100) -> str:
 def clean_description(text: str, limit: int = 100) -> str:
     if not text:
         return ""
-
-    # 템플릿 감지: ## 2. 이후 잘라냄
-    import re
-    match = re.search(r"^##\s*2[\.\s]", text, re.MULTILINE)
+    match = _TEMPLATE_SECTION_RE.search(text)
     if match:
         text = text[:match.start()]
 
@@ -52,14 +65,10 @@ def clean_description(text: str, limit: int = 100) -> str:
 
     if not lines:
         return ""
-
-    # 리스트 항목이면 불릿 형태로, 아니면 한줄
     if len(lines) == 1:
         line = lines[0]
         return line if len(line) <= limit else line[:limit] + "..."
-
-    result = "\n".join(f"• {l}" for l in lines)
-    return result
+    return "\n".join(f"• {l}" for l in lines)
 
 
 def mr_key(project_id, mr_iid) -> str:
@@ -67,7 +76,6 @@ def mr_key(project_id, mr_iid) -> str:
 
 
 def post_main(text: str, title: str, url: str, description: str, color: str = "#36a64f", branch_info: str = "") -> str:
-    footer = branch_info
     res = client.chat_postMessage(
         channel=CHANNEL,
         text=text,
@@ -77,7 +85,7 @@ def post_main(text: str, title: str, url: str, description: str, color: str = "#
                 "title": title,
                 "title_link": url,
                 "text": clean_description(description),
-                "footer": footer,
+                "footer": branch_info,
             }
         ],
     )
@@ -101,25 +109,42 @@ def post_thread(thread_ts: str, text: str, color: str = "", title: str = "", url
 
 @app.post("/gitlab-webhook")
 async def gitlab_webhook(request: Request):
+    if GITLAB_WEBHOOK_TOKEN:
+        token = request.headers.get("X-Gitlab-Token")
+        if token != GITLAB_WEBHOOK_TOKEN:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     data = await request.json()
     kind = data.get("object_kind")
 
+    try:
+        return await _handle(data, kind)
+    except Exception as e:
+        logger.error("Webhook handling failed: %s", e)
+        return {"status": "error", "detail": str(e)}
+
+
+async def _handle(data: dict, kind: str):
     # ── 파이프라인 이벤트 ──────────────────────────────────────────
     if kind == "pipeline":
         status = data.get("object_attributes", {}).get("status")
-        if status not in ("failed",):
+        if status != "failed":
             return {"status": "ignored"}
 
         mr_data = data.get("merge_request") or {}
         project_id = data.get("project", {}).get("id")
         mr_iid = mr_data.get("iid")
-        pipeline_url = data.get("project", {}).get("web_url", "")
         ref = data.get("object_attributes", {}).get("ref", "")
+        pipeline_id = data.get("object_attributes", {}).get("id")
+        project_url = data.get("project", {}).get("web_url", "")
+        pipeline_url = f"{project_url}/-/pipelines/{pipeline_id}" if project_url and pipeline_id else ""
 
         key = mr_key(project_id, mr_iid) if mr_iid else None
         thread_ts = store.get(key) if key else None
 
-        msg = f":x: 파이프라인 실패 (`{ref}`)"
+        link = f" — <{pipeline_url}|파이프라인 보기>" if pipeline_url else ""
+        msg = f":x: 파이프라인 실패 (`{ref}`){link}"
+
         if thread_ts:
             post_thread(thread_ts, msg)
         else:
@@ -140,7 +165,6 @@ async def gitlab_webhook(request: Request):
         mr_url = mr_data.get("url", "")
         note = truncate(attrs.get("note", ""), 80)
 
-        # MR 작성자 멘션 (commenter 제외)
         mr_author = mr_data.get("author", {}).get("username", "") if isinstance(mr_data.get("author"), dict) else ""
         target = mention(mr_author) if mr_author and mr_author != commenter else ""
 
@@ -158,7 +182,10 @@ async def gitlab_webhook(request: Request):
     if kind != "merge_request":
         return {"status": "ignored"}
 
-    attrs = data["object_attributes"]
+    attrs = data.get("object_attributes")
+    if not attrs:
+        return {"status": "ignored"}
+
     action = attrs.get("action", "open")
     title = attrs.get("title", "(제목 없음)")
     url = attrs.get("url", "")
